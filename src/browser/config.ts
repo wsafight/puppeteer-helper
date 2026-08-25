@@ -1,9 +1,8 @@
-import { getBrowserlaunchArgs } from '../constants';
 import { invariant } from '../utils';
 
-interface BrowserConfig {
+export interface BrowserConfig {
   executablePath: string;
-  headless?: boolean;
+  headless?: boolean | 'shell';
   launchArgs?: string[];
 }
 
@@ -13,13 +12,14 @@ let finalConfig: BrowserConfig;
 const DEFAULT_CONFIG: BrowserConfig = {
   executablePath: '',
   headless: true,
-  launchArgs: getBrowserlaunchArgs(),
+  launchArgs: [],
 };
 
+/** @deprecated Use createRenderer with instance-level options. */
 export const configureBrowserConfig = ({
   executablePath,
   headless = true,
-  launchArgs = getBrowserlaunchArgs(),
+  launchArgs = [],
 } = DEFAULT_CONFIG) => {
   /**  A browser location that actually works  */
   invariant(
@@ -35,4 +35,7 @@ export const configureBrowserConfig = ({
   Object.freeze(finalConfig);
 };
 
-export const getBrowserConfig = () => finalConfig;
+export const getBrowserConfig = () => {
+  invariant(!finalConfig, 'configureBrowserConfig must be called first');
+  return finalConfig;
+};

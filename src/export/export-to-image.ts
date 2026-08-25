@@ -1,5 +1,9 @@
 import { type ScreenshotOptions } from 'puppeteer-core';
-import { BasicActionArgs, checkBasicActionArgs, getBrowserPage } from '@/basic';
+import {
+  type BasicActionArgs,
+  checkBasicActionArgs,
+  getBrowserPage,
+} from '../basic';
 
 export interface ExportToImageArgs extends BasicActionArgs {
   /** Image type, default png */
@@ -8,6 +12,7 @@ export interface ExportToImageArgs extends BasicActionArgs {
   screenshotOptions?: ScreenshotOptions;
 }
 
+/** @deprecated Use renderer.image(). */
 export const exportToImage = async ({
   url = '',
   savePath = '',
@@ -16,10 +21,17 @@ export const exportToImage = async ({
   screenshotOptions,
   viewport,
   pageFunction,
+  navigationOptions,
 }: ExportToImageArgs): Promise<void> => {
   checkBasicActionArgs({ url, savePath });
 
-  const page = await getBrowserPage({ url, userAgent, viewport, pageFunction });
+  const page = await getBrowserPage({
+    url,
+    userAgent,
+    viewport,
+    pageFunction,
+    navigationOptions,
+  });
 
   const imgOptions = {
     type,
@@ -28,6 +40,9 @@ export const exportToImage = async ({
     ...screenshotOptions,
   };
 
-  await page.screenshot(imgOptions);
-  await page.close();
+  try {
+    await page.screenshot(imgOptions);
+  } finally {
+    await page.close();
+  }
 };

@@ -1,0 +1,3 @@
+interface:
+  display_name: 'Pptr Helper Render'
+  short_description: 'Render, extract, and batch webpages with pptr-helper'

@@ -1,25 +1,38 @@
 import { type Page } from 'puppeteer-core';
-import { BasicActionArgs, getBrowserPage } from '../basic';
-import { invariant } from '@/utils';
+import { type BasicActionArgs, getBrowserPage } from '../basic';
+import { invariant } from '../utils';
 
-export type GetEvalResultFromPage = Omit<BasicActionArgs, 'savePath'> & {
-  evalFunction: (page: Page) => Promise<any>;
+export type GetEvalResultFromPage<T = unknown> = Omit<
+  BasicActionArgs,
+  'savePath'
+> & {
+  evalFunction: (page: Page) => Promise<T>;
 };
 
-export const getEvalResult = async ({
+/** @deprecated Use renderer.evaluate(). */
+export const getEvalResult = async <T>({
   url = '',
   userAgent,
   viewport,
   pageFunction,
   evalFunction,
-}: GetEvalResultFromPage) => {
+  navigationOptions,
+}: GetEvalResultFromPage<T>): Promise<T> => {
   invariant(
     typeof url !== 'string' || !url,
     'url must be a string and cannot be empty',
   );
 
-  const page = await getBrowserPage({ url, userAgent, viewport, pageFunction });
-  const result = await evalFunction(page);
-  await page.close();
-  return result;
+  const page = await getBrowserPage({
+    url,
+    userAgent,
+    viewport,
+    pageFunction,
+    navigationOptions,
+  });
+  try {
+    return await evalFunction(page);
+  } finally {
+    await page.close();
+  }
 };

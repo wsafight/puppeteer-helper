@@ -1,7 +1,7 @@
-import { type Page } from 'puppeteer-core';
-import { invariant } from '@/utils';
-import { getBrowser } from '@/browser/get-browser';
-import { DEFAULT_USER_AGENT, getDefaultViewport } from '@/constants';
+import { type GoToOptions, type Page, type Viewport } from 'puppeteer-core';
+import { getBrowser } from './browser/get-browser';
+import { getDefaultViewport } from './constants';
+import { invariant } from './utils';
 
 export interface BasicActionArgs {
   /** The URL of the webpage that needs to be screenshot */
@@ -13,10 +13,9 @@ export interface BasicActionArgs {
   /** callback function */
   pageFunction?: (page: Page) => Promise<void>;
   /** viewport */
-  viewport?: {
-    width: number;
-    height: number;
-  };
+  viewport?: Viewport;
+  /** Puppeteer navigation options. */
+  navigationOptions?: GoToOptions;
 }
 
 export const checkBasicActionArgs = ({ url, savePath }: BasicActionArgs) => {
@@ -35,18 +34,27 @@ export const getBrowserPage = async ({
   userAgent,
   viewport,
   pageFunction,
+  navigationOptions,
 }: Omit<BasicActionArgs, 'savePath'>): Promise<Page> => {
   const browser = await getBrowser();
   const page = await browser.newPage();
 
-  await page.setUserAgent(userAgent || DEFAULT_USER_AGENT);
-  await page.goto(url, { waitUntil: 'domcontentloaded' });
+  try {
+    await page.setViewport(viewport ?? getDefaultViewport());
+    if (userAgent) {
+      await page.setUserAgent({ userAgent });
+    }
+    await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      ...navigationOptions,
+    });
 
-  const { width, height } = { ...getDefaultViewport(), ...viewport };
-  await page.setViewport({ width, height });
-
-  if (pageFunction) {
-    await pageFunction(page);
+    if (pageFunction) {
+      await pageFunction(page);
+    }
+    return page;
+  } catch (error) {
+    await page.close();
+    throw error;
   }
-  return page;
 };

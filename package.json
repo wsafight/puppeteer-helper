@@ -1,64 +1,105 @@
 {
-  "name": "tool-library-template",
+  "name": "pptr-helper",
   "version": "0.0.4",
-  "jsnext:source": "./src/index.ts",
-  "types": "./dist/types/index.d.ts",
-  "main": "./dist/lib/index.js",
-  "module": "./dist/es/index.js",
+  "type": "module",
+  "description": "Deterministic webpage rendering for screenshots, PDFs, and extraction with Puppeteer.",
+  "keywords": [
+    "puppeteer",
+    "screenshot",
+    "pdf",
+    "browser-automation",
+    "web-rendering"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wsafight/pptr-helper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wsafight/pptr-helper/issues"
+  },
+  "homepage": "https://github.com/wsafight/pptr-helper#readme",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "LICENSE",
+    "MIGRATION.md",
+    "README.md",
+    "README.EN.md",
+    "scripts/install-browser.mjs",
+    "skills"
+  ],
+  "bin": {
+    "pptr-helper": "./bin/pptr-helper.mjs"
+  },
+  "types": "./dist/index.d.ts",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
   "scripts": {
-    "prepare": "modern build && husky install",
-    "dev": "modern dev",
-    "build": "modern build",
-    "build:watch": "modern build -w",
-    "reset": "rimraf ./**/node_modules",
-    "lint": "modern lint",
-    "change": "modern change",
-    "bump": "modern bump",
-    "pre": "modern pre",
-    "change-status": "modern change-status",
-    "gen-release-note": "modern gen-release-note",
-    "release": "modern release",
-    "new": "modern new",
-    "upgrade": "modern upgrade",
-    "test": "modern test",
-    "np": "np"
+    "prepare": "rslib build",
+    "dev": "rslib build --watch",
+    "build": "rslib build",
+    "browser:install": "pnpm build && node scripts/install-browser.mjs",
+    "cli": "pnpm build && node bin/pptr-helper.mjs",
+    "check": "pnpm lint && pnpm format:check && pnpm typecheck && pnpm test:unit && pnpm build",
+    "clean": "rimraf dist",
+    "lint": "oxlint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "change": "changeset",
+    "bump": "changeset version",
+    "release": "pnpm build && changeset publish",
+    "prepublishOnly": "pnpm check",
+    "test": "vitest run",
+    "test:browser": "vitest run tests/renderer.integration.test.ts",
+    "test:unit": "vitest run tests/index.test.ts tests/task-queue.test.ts tests/browser-manager.test.ts tests/network.test.ts",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tests/tsconfig.json --noEmit"
   },
   "lint-staged": {
     "*.{ts,tsx}": [
-      "node --max_old_space_size=8192 ./node_modules/eslint/bin/eslint.js --fix --color --cache --quiet"
+      "oxlint --fix",
+      "prettier --write"
     ],
     "*.{js,jsx,mjs,mjsx,cjs,cjsx}": [
-      "node --max_old_space_size=8192 ./node_modules/eslint/bin/eslint.js --fix --color --cache --quiet"
+      "oxlint --fix",
+      "prettier --write"
+    ],
+    "*.{json,md,yaml,yml}": [
+      "prettier --write"
     ]
   },
-  "eslintIgnore": [
-    "node_modules/",
-    "dist/"
-  ],
   "dependencies": {
-    "puppeteer-core": "23.4.0"
+    "@puppeteer/browsers": "3.2.1",
+    "puppeteer-core": "25.9.0"
   },
-  "peerDependencies": {},
   "devDependencies": {
-    "@modern-js/module-tools": "2.48.3",
-    "@modern-js/eslint-config": "2.48.3",
-    "@modern-js/tsconfig": "2.48.3",
-    "@modern-js-app/eslint-config": "2.48.3",
-    "rimraf": "5.0.5",
-    "lint-staged": "15.2.2",
-    "prettier": "3.2.5",
-    "husky": "9.0.11",
-    "typescript": "5.4.3",
-    "@types/jest": "29.5.12",
-    "@types/node": "20.11.30",
-    "@types/react": "18.2.69",
-    "@modern-js/plugin-testing": "2.48.3",
-    "np": "10.0.2"
+    "@changesets/cli": "3.0.1",
+    "@rslib/core": "0.23.2",
+    "@types/node": "24.13.3",
+    "husky": "9.1.7",
+    "lint-staged": "17.3.0",
+    "oxlint": "1.80.0",
+    "prettier": "3.9.6",
+    "rimraf": "6.1.3",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
   },
-  "sideEffects": [],
+  "sideEffects": false,
   "publishConfig": {
     "access": "public",
+    "provenance": true,
     "registry": "https://registry.npmjs.org/"
   },
-  "packageManager": "pnpm@9.6.0+sha512.38dc6fba8dba35b39340b9700112c2fe1e12f10b17134715a4aa98ccf7bb035e76fd981cf0bb384dfa98f8d6af5481c2bef2f4266a24bfa20c34eb7147ce0b5e"
+  "packageManager": "pnpm@11.24.0"
 }

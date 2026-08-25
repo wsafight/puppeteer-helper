@@ -1,0 +1,4 @@
+allowBuilds:
+  core-js: false
+minimumReleaseAgeExclude:
+  - puppeteer-core@25.9.0

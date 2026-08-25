@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.24.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm format:check
+      - run: pnpm typecheck
+      - run: pnpm test:unit
+      - run: pnpm build
+
+  browser:
+    name: Browser (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: system-stable
+            executable: /usr/bin/google-chrome
+            auto-install: 'false'
+            force-managed: 'false'
+          - mode: puppeteer-revision
+            executable: ''
+            auto-install: 'true'
+            force-managed: 'true'
+    env:
+      PPTR_AUTO_INSTALL: ${{ matrix.auto-install }}
+      PPTR_CACHE_DIR: ${{ runner.temp }}/pptr-helper-browser
+      PPTR_EXECUTABLE_PATH: ${{ matrix.executable }}
+      PPTR_FORCE_MANAGED: ${{ matrix.force-managed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.24.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/cache@v4
+        if: matrix.force-managed == 'true'
+        with:
+          path: ${{ runner.temp }}/pptr-helper-browser
+          key: chrome-for-testing-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:browser
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.24.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+      - run: node bin/pptr-helper.mjs --help
+      - run: npm pack --dry-run
