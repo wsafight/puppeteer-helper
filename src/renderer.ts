@@ -2,11 +2,14 @@ import { randomUUID } from 'node:crypto';
 import { access } from 'node:fs/promises';
 import {
   connect,
+  KnownDevices,
   launch,
   type Browser,
   type BrowserContextOptions,
   type ConnectOptions,
   type CookieData,
+  type Device,
+  type FrameWaitForFunctionOptions,
   type GoToOptions,
   type HTTPResponse,
   type LaunchOptions,
@@ -27,13 +30,23 @@ import {
   waitForDeterministicPage,
   type DeterministicPreset,
 } from './deterministic';
+import {
+  setupPageDiagnostics,
+  type PageDiagnostics,
+  type PageDiagnosticsOptions,
+  type RenderArtifacts,
+} from './diagnostics';
 import { RendererClosedError, RendererError } from './errors';
 import {
   resolveManagedBrowser,
   type BrowserManagementOptions,
 } from './browser/managed-browser';
 import { TaskQueue } from './internal/task-queue';
-import { createTaskSignal, raceWithSignal } from './internal/task-signal';
+import {
+  createTaskSignal,
+  raceWithSignal,
+  raceWithSignalAndCleanup,
+} from './internal/task-signal';
 import {
   assertNavigationAllowed,
   getBrowserSecurityOptions,
@@ -43,6 +56,20 @@ import {
   type NetworkStats,
   type RendererSecurityOptions,
 } from './network';
+import {
+  IMAGE_OUTPUT_PRESETS,
+  PDF_OUTPUT_PRESETS,
+  resolveDeviceProfile,
+  type DevicePresetName,
+  type ImageOutputPresetName,
+  type PdfOutputPresetName,
+} from './presets';
+import {
+  TaskAdmissionController,
+  validateSchedulerOptions,
+  type RendererSchedulerOptions,
+} from './scheduler';
+import { comparePng, type PngComparisonResult } from './visual';
 
 type Awaitable<T> = T | Promise<T>;
 
@@ -57,6 +84,39 @@ export interface RenderWaitOptions {
   networkIdle?: boolean | WaitForNetworkIdleOptions;
   /** Wait until all document fonts are ready. */
   fonts?: boolean;
+  /** Wait for a fixed number of milliseconds. */
+  delay?: number;
+  /** Wait until the document body contains the requested text. */
+  text?: string | { value: string; exact?: boolean };
+  /** Wait until a page expression or predicate returns a truthy value. */
+  function?: string | (() => unknown);
+  functionOptions?: Omit<FrameWaitForFunctionOptions, 'signal'>;
+  /** Wait for every nested condition concurrently. */
+  all?: RenderWaitOptions[];
+  /** Wait for the first successful nested condition. */
+  any?: RenderWaitOptions[];
+}
+
+export interface BrowserStorageEntry {
+  name: string;
+  value: string;
+}
+
+export interface BrowserOriginStorage {
+  origin: string;
+  localStorage?: BrowserStorageEntry[];
+  sessionStorage?: BrowserStorageEntry[];
+}
+
+export interface BrowserStorageState {
+  cookies?: CookieData[];
+  origins?: BrowserOriginStorage[];
+}
+
+export interface ResultCacheOptions {
+  key: string;
+  /** Completed-result lifetime in milliseconds. Omit or use 0 for in-flight deduplication only. */
+  ttl?: number;
 }
 
 export interface RenderPageOptions {
@@ -64,9 +124,17 @@ export interface RenderPageOptions {
   /** Override BrowserContext settings such as a per-task proxy. */
   contextOptions?: BrowserContextOptions;
   viewport?: Viewport;
+  /** Built-in alias, Puppeteer KnownDevices name, or a custom device. */
+  device?: DevicePresetName | keyof typeof KnownDevices | Device;
   userAgent?: string;
   headers?: Record<string, string>;
   cookies?: CookieData[];
+  /** Restore cookies and Web Storage before navigation. */
+  storageState?: BrowserStorageState;
+  /** Include the final cookies and current-origin Web Storage in result metadata. */
+  captureStorageState?: boolean;
+  /** Opt-in page diagnostics and diagnostic artifacts. */
+  diagnostics?: PageDiagnosticsOptions;
   navigation?: GoToOptions;
   content?: SetContentWaitForOptions;
   wait?: RenderWaitOptions;
@@ -80,6 +148,12 @@ export interface RenderPageOptions {
   signal?: AbortSignal;
   /** Correlation identifier used in events and result metadata. */
   taskId?: string;
+  /** Higher values run before lower-priority pending tasks. */
+  priority?: number;
+  tenantId?: string;
+  tags?: Record<string, string>;
+  /** Explicit task-result deduplication and caching. */
+  resultCache?: ResultCacheOptions;
   /** Total queue and execution timeout. Use 0 to disable. */
   timeout?: number;
   beforeNavigate?: (page: Page) => Awaitable<void>;
@@ -91,10 +165,27 @@ export interface ImageRenderOptions extends RenderPageOptions {
   selector?: string;
   selectorOptions?: WaitForSelectorOptions;
   output?: ScreenshotOptions;
+  preset?: ImageOutputPresetName;
 }
 
 export interface PdfRenderOptions extends RenderPageOptions {
   output?: PDFOptions;
+  preset?: PdfOutputPresetName;
+}
+
+export interface VisualCompareOptions extends RenderPageOptions {
+  baseline: string | Uint8Array;
+  /** Hide matching elements in the current render before comparison. */
+  ignoreSelectors?: string[];
+  actualPath?: string;
+  diffPath?: string;
+  maxDiffPixels?: number;
+  maxDiffRatio?: number;
+  threshold?: number;
+  includeAA?: boolean;
+  diffMask?: boolean;
+  output?: Omit<ScreenshotOptions, 'encoding' | 'path' | 'type'>;
+  preset?: ImageOutputPresetName;
 }
 
 export interface EvaluateOptions<T> extends RenderPageOptions {
@@ -144,16 +235,23 @@ export interface RenderMetadata {
   statusCode?: number;
   pageErrors: string[];
   network: NetworkStats;
+  storageState?: BrowserStorageState;
+  diagnostics?: PageDiagnostics;
+  cacheHit?: boolean;
+  tenantId?: string;
+  tags?: Record<string, string>;
 }
 
 export interface RenderResult<T> {
   data: T;
   metadata: RenderMetadata;
+  artifacts?: RenderArtifacts;
 }
 
 export type RendererBatchTask =
   | { id?: string; type: 'image'; options: ImageRenderOptions }
   | { id?: string; type: 'pdf'; options: PdfRenderOptions }
+  | { id?: string; type: 'compare'; options: VisualCompareOptions }
   | { id?: string; type: 'evaluate'; options: EvaluateOptions<unknown> };
 
 export interface RendererBatchOptions {
@@ -200,8 +298,10 @@ export interface RendererOptions {
   network?: NetworkOptions;
   /** Opt-in retry policy for transient task failures. */
   retry?: RendererRetryOptions;
-  /** Browser and per-task network guardrails. */
+  /** Opt-in browser and per-task network guardrails. No URL policy is applied when omitted. */
   security?: RendererSecurityOptions;
+  /** Priority, hostname/tenant admission limits, and result-cache bounds. */
+  scheduler?: RendererSchedulerOptions;
   /** Non-blocking lifecycle event sink. */
   onEvent?: (event: RendererEvent) => Awaitable<void>;
 }
@@ -236,6 +336,10 @@ export interface Renderer {
   imageResult(options: ImageRenderOptions): Promise<RenderResult<Uint8Array>>;
   pdf(options: PdfRenderOptions): Promise<Uint8Array>;
   pdfResult(options: PdfRenderOptions): Promise<RenderResult<Uint8Array>>;
+  compare(options: VisualCompareOptions): Promise<PngComparisonResult>;
+  compareResult(
+    options: VisualCompareOptions,
+  ): Promise<RenderResult<PngComparisonResult>>;
   evaluate<T>(options: EvaluateOptions<T>): Promise<T>;
   evaluateResult<T>(options: EvaluateOptions<T>): Promise<RenderResult<T>>;
   batch(
@@ -261,10 +365,13 @@ const isUrlSource = (
 
 interface PageAttemptResult<T> {
   data: T;
+  artifacts?: RenderArtifacts;
+  diagnostics?: PageDiagnostics;
   finalUrl: string;
   statusCode?: number;
   pageErrors: string[];
   network: NetworkStats;
+  storageState?: BrowserStorageState;
 }
 
 interface RetriedPageResult<T> extends PageAttemptResult<T> {
@@ -279,9 +386,18 @@ interface ResolvedRetryOptions {
   shouldRetry?: RendererRetryOptions['shouldRetry'];
 }
 
+interface CachedRenderResult {
+  expiresAt: number;
+  result: RenderResult<unknown>;
+}
+
 class PuppeteerRenderer implements Renderer {
   readonly #options: RendererOptions;
   readonly #queue: TaskQueue;
+  readonly #admission: TaskAdmissionController;
+  readonly #resultCache = new Map<string, CachedRenderResult>();
+  readonly #inFlightResults = new Map<string, Promise<RenderResult<unknown>>>();
+  readonly #cacheMaxEntries: number;
   readonly #shutdown = new AbortController();
   readonly #maxConcurrency: number;
   readonly #taskTimeout: number;
@@ -303,6 +419,7 @@ class PuppeteerRenderer implements Renderer {
     this.#validateInteger('taskTimeout', taskTimeout, 0);
     this.#validateRetry(options.retry);
     validateSecurityOptions(options.security);
+    validateSchedulerOptions(options.scheduler);
     if (
       options.connectOptions &&
       (options.executablePath || options.launchOptions || options.browser)
@@ -326,6 +443,8 @@ class PuppeteerRenderer implements Renderer {
     this.#options = options;
     this.#maxConcurrency = maxConcurrency;
     this.#taskTimeout = taskTimeout;
+    this.#cacheMaxEntries = options.scheduler?.cacheMaxEntries ?? 100;
+    this.#admission = new TaskAdmissionController(options.scheduler);
     this.#queue = new TaskQueue({ maxConcurrency, maxQueueSize });
   }
 
@@ -357,18 +476,26 @@ class PuppeteerRenderer implements Renderer {
   async imageResult(
     options: ImageRenderOptions,
   ): Promise<RenderResult<string | Uint8Array>> {
-    return this.#withPage(options, async page => {
-      if (options.selector) {
+    const preset = options.preset
+      ? IMAGE_OUTPUT_PRESETS[options.preset]
+      : undefined;
+    const resolved = {
+      ...options,
+      output: { ...preset?.output, ...options.output },
+      viewport: options.viewport ?? preset?.viewport,
+    };
+    return this.#withPage(resolved, async page => {
+      if (resolved.selector) {
         const element = await page.waitForSelector(
-          options.selector,
-          options.selectorOptions,
+          resolved.selector,
+          resolved.selectorOptions,
         );
         if (!element) {
-          throw new Error(`Element was not found: ${options.selector}`);
+          throw new Error(`Element was not found: ${resolved.selector}`);
         }
-        return element.screenshot(options.output);
+        return element.screenshot(resolved.output);
       }
-      return page.screenshot({ fullPage: true, ...options.output });
+      return page.screenshot({ fullPage: true, ...resolved.output });
     });
   }
 
@@ -379,7 +506,55 @@ class PuppeteerRenderer implements Renderer {
   async pdfResult(
     options: PdfRenderOptions,
   ): Promise<RenderResult<Uint8Array>> {
-    return this.#withPage(options, page => page.pdf(options.output));
+    const output = {
+      ...(options.preset ? PDF_OUTPUT_PRESETS[options.preset] : undefined),
+      ...options.output,
+    };
+    return this.#withPage(options, page => page.pdf(output));
+  }
+
+  async compare(options: VisualCompareOptions): Promise<PngComparisonResult> {
+    return (await this.compareResult(options)).data;
+  }
+
+  async compareResult(
+    options: VisualCompareOptions,
+  ): Promise<RenderResult<PngComparisonResult>> {
+    const { afterNavigate, ignoreSelectors = [] } = options;
+    const rendered = await this.imageResult({
+      ...options,
+      afterNavigate: async page => {
+        await afterNavigate?.(page);
+        for (const selector of ignoreSelectors) {
+          await page.$$eval(selector, elements => {
+            for (const element of elements) {
+              element.setAttribute('data-pptr-helper-ignore', '');
+            }
+          });
+        }
+        if (ignoreSelectors.length) {
+          await page.addStyleTag({
+            content:
+              '[data-pptr-helper-ignore] { visibility: hidden !important; }',
+          });
+        }
+      },
+      output: { ...options.output, type: 'png' },
+    });
+    return {
+      ...rendered,
+      data: await comparePng({
+        actual: rendered.data,
+        actualPath: options.actualPath,
+        baseline: options.baseline,
+        diffMask: options.diffMask,
+        diffPath: options.diffPath,
+        includeAA: options.includeAA,
+        maxDiffPixels: options.maxDiffPixels,
+        maxDiffRatio: options.maxDiffRatio,
+        threshold: options.threshold,
+      }),
+    };
   }
 
   async evaluate<T>(options: EvaluateOptions<T>): Promise<T> {
@@ -465,6 +640,7 @@ class PuppeteerRenderer implements Renderer {
           await browser.disconnect();
         }
       }
+      this.#resultCache.clear();
       this.#closed = true;
     })();
 
@@ -555,14 +731,75 @@ class PuppeteerRenderer implements Renderer {
     options: RenderPageOptions,
     operation: (page: Page) => Awaitable<T>,
   ): Promise<RenderResult<T>> {
+    if (this.#closed || this.#closing) {
+      throw new RendererClosedError();
+    }
     validateSource(options.source);
     if (isUrlSource(options.source)) {
       assertNavigationAllowed(options.source.url, this.#options.security);
     }
+    const cache = options.resultCache;
+    if (!cache) {
+      return this.#withPageUncached(options, operation);
+    }
+
+    const key = typeof cache.key === 'string' ? cache.key.trim() : '';
+    if (!key) {
+      throw new Error('resultCache.key cannot be empty');
+    }
+    const ttl = cache.ttl ?? 0;
+    this.#validateInteger('resultCache.ttl', ttl, 0);
+
+    const cached = this.#resultCache.get(key);
+    if (cached) {
+      if (cached.expiresAt > Date.now()) {
+        this.#resultCache.delete(key);
+        this.#resultCache.set(key, cached);
+        const result = await this.#waitForSharedResult(
+          Promise.resolve(cached.result),
+          options,
+        );
+        return this.#cacheHit(result, options) as RenderResult<T>;
+      }
+      this.#resultCache.delete(key);
+    }
+
+    const inFlight = this.#inFlightResults.get(key);
+    if (inFlight) {
+      const result = await this.#waitForSharedResult(inFlight, options);
+      return this.#cacheHit(result, options) as RenderResult<T>;
+    }
+
+    const execution = this.#withPageUncached(options, operation);
+    this.#inFlightResults.set(key, execution as Promise<RenderResult<unknown>>);
+    try {
+      const result = await execution;
+      if (ttl > 0 && this.#cacheMaxEntries > 0) {
+        this.#storeCachedResult(key, result, ttl);
+      }
+      return result;
+    } finally {
+      if (this.#inFlightResults.get(key) === execution) {
+        this.#inFlightResults.delete(key);
+      }
+    }
+  }
+
+  async #withPageUncached<T>(
+    options: RenderPageOptions,
+    operation: (page: Page) => Awaitable<T>,
+  ): Promise<RenderResult<T>> {
     const timeout = options.timeout ?? this.#taskTimeout;
     this.#validateInteger('timeout', timeout, 0);
     this.#validateRetry(options.retry === false ? undefined : options.retry);
+    const priority = options.priority ?? 0;
+    if (!Number.isSafeInteger(priority)) {
+      throw new Error('priority must be an integer');
+    }
     const taskId = options.taskId?.trim() || randomUUID();
+    const host = isUrlSource(options.source)
+      ? new URL(options.source.url).hostname.toLowerCase()
+      : undefined;
     const queuedAt = Date.now();
     let startedAt = queuedAt;
     const taskSignal = createTaskSignal({
@@ -573,16 +810,25 @@ class PuppeteerRenderer implements Renderer {
     this.#emit({ type: 'task.queued', taskId });
 
     try {
-      const result = await this.#queue.enqueue(() => {
-        startedAt = Date.now();
-        this.#emit({ type: 'task.started', taskId, attempt: 1 });
-        return this.#runPageWithRetry(
-          options,
-          operation,
-          taskSignal.signal,
-          taskId,
-        );
-      }, taskSignal.signal);
+      const result = await this.#queue.enqueue(
+        () =>
+          this.#admission.run(
+            { host, tenantId: options.tenantId },
+            taskSignal.signal,
+            () => {
+              startedAt = Date.now();
+              this.#emit({ type: 'task.started', taskId, attempt: 1 });
+              return this.#runPageWithRetry(
+                options,
+                operation,
+                taskSignal.signal,
+                taskId,
+              );
+            },
+          ),
+        taskSignal.signal,
+        priority,
+      );
       const finishedAt = Date.now();
       this.#succeeded += 1;
       this.#emit({
@@ -592,6 +838,7 @@ class PuppeteerRenderer implements Renderer {
       });
       return {
         data: result.data,
+        artifacts: result.artifacts,
         metadata: {
           taskId,
           attempts: result.attempts,
@@ -605,6 +852,10 @@ class PuppeteerRenderer implements Renderer {
           statusCode: result.statusCode,
           pageErrors: result.pageErrors,
           network: result.network,
+          storageState: result.storageState,
+          diagnostics: result.diagnostics,
+          tenantId: options.tenantId,
+          tags: options.tags ? { ...options.tags } : undefined,
         },
       };
     } catch (error) {
@@ -613,6 +864,58 @@ class PuppeteerRenderer implements Renderer {
       throw error;
     } finally {
       taskSignal.dispose();
+    }
+  }
+
+  async #waitForSharedResult(
+    result: Promise<RenderResult<unknown>>,
+    options: RenderPageOptions,
+  ): Promise<RenderResult<unknown>> {
+    const timeout = options.timeout ?? this.#taskTimeout;
+    this.#validateInteger('timeout', timeout, 0);
+    const taskSignal = createTaskSignal({
+      caller: options.signal,
+      shutdown: this.#shutdown.signal,
+      timeout,
+    });
+    try {
+      return await raceWithSignal(result, taskSignal.signal);
+    } finally {
+      taskSignal.dispose();
+    }
+  }
+
+  #cacheHit(
+    result: RenderResult<unknown>,
+    options: RenderPageOptions,
+  ): RenderResult<unknown> {
+    return {
+      ...result,
+      metadata: {
+        ...result.metadata,
+        cacheHit: true,
+        tenantId: options.tenantId ?? result.metadata.tenantId,
+        tags: options.tags ? { ...options.tags } : result.metadata.tags,
+      },
+    };
+  }
+
+  #storeCachedResult(
+    key: string,
+    result: RenderResult<unknown>,
+    ttl: number,
+  ): void {
+    this.#resultCache.delete(key);
+    this.#resultCache.set(key, {
+      expiresAt: Date.now() + ttl,
+      result,
+    });
+    while (this.#resultCache.size > this.#cacheMaxEntries) {
+      const oldest = this.#resultCache.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.#resultCache.delete(oldest);
     }
   }
 
@@ -661,12 +964,13 @@ class PuppeteerRenderer implements Renderer {
   ): Promise<PageAttemptResult<T>> {
     const browser = await raceWithSignal(this.#getBrowser(), signal);
     signal.throwIfAborted();
-    const context = await raceWithSignal(
+    const context = await raceWithSignalAndCleanup(
       browser.createBrowserContext({
         ...this.#options.contextOptions,
         ...options.contextOptions,
       }),
       signal,
+      context => context.close(),
     );
 
     try {
@@ -675,6 +979,7 @@ class PuppeteerRenderer implements Renderer {
       page.on('pageerror', error => {
         pageErrors.push(error instanceof Error ? error.message : String(error));
       });
+      const diagnostics = setupPageDiagnostics(page, options.diagnostics);
       const network = await setupPageNetwork(
         page,
         options.network
@@ -687,20 +992,31 @@ class PuppeteerRenderer implements Renderer {
         const execution = (async (): Promise<PageAttemptResult<T>> => {
           const response = await this.#preparePage(page, options, signal);
           const data = await operation(page);
+          const storageState = options.captureStorageState
+            ? await this.#captureStorageState(page)
+            : undefined;
+          const artifacts = await diagnostics.captureArtifacts();
           return {
             data,
+            artifacts,
+            diagnostics: diagnostics.diagnostics,
             finalUrl: page.url(),
             statusCode: response?.status(),
             pageErrors,
             network: { ...network.stats },
+            storageState,
           };
         })();
         return await raceWithSignal(
           Promise.race([execution, network.failure]),
           signal,
         );
+      } catch (error) {
+        await diagnostics.captureFailureScreenshot();
+        throw error;
       } finally {
         await network.dispose();
+        await diagnostics.dispose();
       }
     } finally {
       if (!context.closed) {
@@ -718,8 +1034,15 @@ class PuppeteerRenderer implements Renderer {
       options.deterministic ?? this.#options.deterministic,
     );
 
-    await page.setViewport(options.viewport ?? getDefaultViewport());
+    const device = resolveDeviceProfile(options.device);
+    await page.setViewport(
+      options.viewport ?? device?.viewport ?? getDefaultViewport(),
+    );
+    if (device?.userAgent) {
+      await page.setUserAgent({ userAgent: device.userAgent });
+    }
     await prepareDeterministicPage(page, deterministic);
+    await this.#prepareStorageState(page, options.storageState);
 
     if (options.userAgent) {
       await page.setUserAgent({ userAgent: options.userAgent });
@@ -730,6 +1053,9 @@ class PuppeteerRenderer implements Renderer {
     };
     if (Object.keys(headers).length > 0) {
       await page.setExtraHTTPHeaders(headers);
+    }
+    if (options.storageState?.cookies?.length) {
+      await page.browserContext().setCookie(...options.storageState.cookies);
     }
     if (options.cookies?.length) {
       await page.browserContext().setCookie(...options.cookies);
@@ -758,13 +1084,74 @@ class PuppeteerRenderer implements Renderer {
     return response;
   }
 
+  async #prepareStorageState(
+    page: Page,
+    storageState: BrowserStorageState | undefined,
+  ): Promise<void> {
+    if (!storageState?.origins?.length) {
+      return;
+    }
+    await page.evaluateOnNewDocument(origins => {
+      const state = origins.find(item => item.origin === location.origin);
+      if (!state) {
+        return;
+      }
+      for (const entry of state.localStorage ?? []) {
+        localStorage.setItem(entry.name, entry.value);
+      }
+      for (const entry of state.sessionStorage ?? []) {
+        sessionStorage.setItem(entry.name, entry.value);
+      }
+    }, storageState.origins);
+  }
+
+  async #captureStorageState(page: Page): Promise<BrowserStorageState> {
+    const cookies = await page.browserContext().cookies();
+    const origin = await page
+      .evaluate(() => {
+        if (location.origin === 'null') {
+          return undefined;
+        }
+        const readStorage = (storage: Storage): BrowserStorageEntry[] =>
+          Array.from({ length: storage.length }, (_, index) => {
+            const name = storage.key(index) ?? '';
+            return { name, value: storage.getItem(name) ?? '' };
+          });
+        return {
+          origin: location.origin,
+          localStorage: readStorage(localStorage),
+          sessionStorage: readStorage(sessionStorage),
+        };
+      })
+      .catch(() => undefined);
+    return {
+      cookies,
+      origins: origin ? [origin] : [],
+    };
+  }
+
   async #waitUntilReady(
     page: Page,
     wait: RenderWaitOptions | undefined,
     signal: AbortSignal,
   ): Promise<void> {
+    if (!wait) {
+      return;
+    }
+    if (
+      wait.delay !== undefined &&
+      (!Number.isFinite(wait.delay) || wait.delay < 0)
+    ) {
+      throw new Error('wait.delay must be a non-negative finite number');
+    }
+    if (wait.delay) {
+      await this.#delay(wait.delay, signal);
+    }
     if (wait?.selector) {
-      await page.waitForSelector(wait.selector, wait.selectorOptions);
+      await page.waitForSelector(wait.selector, {
+        ...wait.selectorOptions,
+        signal,
+      });
     }
     if (wait?.networkIdle) {
       await page.waitForNetworkIdle(
@@ -778,6 +1165,62 @@ class PuppeteerRenderer implements Renderer {
         await document.fonts.ready;
       });
     }
+    if (wait.text !== undefined) {
+      const text =
+        typeof wait.text === 'string'
+          ? { exact: false, value: wait.text }
+          : { exact: false, ...wait.text };
+      await page.waitForFunction(
+        expected => {
+          const content = document.body?.innerText ?? '';
+          return expected.exact
+            ? content.trim() === expected.value
+            : content.includes(expected.value);
+        },
+        { signal },
+        text,
+      );
+    }
+    if (wait.function !== undefined) {
+      await page.waitForFunction(wait.function, {
+        ...wait.functionOptions,
+        signal,
+      });
+    }
+    if (wait.all) {
+      if (wait.all.length === 0) {
+        throw new Error('wait.all cannot be empty');
+      }
+      await this.#waitForConditions(page, wait.all, signal, 'all');
+    }
+    if (wait.any) {
+      if (wait.any.length === 0) {
+        throw new Error('wait.any cannot be empty');
+      }
+      await this.#waitForConditions(page, wait.any, signal, 'any');
+    }
+  }
+
+  async #waitForConditions(
+    page: Page,
+    conditions: RenderWaitOptions[],
+    signal: AbortSignal,
+    mode: 'all' | 'any',
+  ): Promise<void> {
+    const controller = new AbortController();
+    const combined = AbortSignal.any([signal, controller.signal]);
+    const waits = conditions.map(condition =>
+      this.#waitUntilReady(page, condition, combined),
+    );
+    try {
+      if (mode === 'all') {
+        await Promise.all(waits);
+      } else {
+        await Promise.any(waits);
+      }
+    } finally {
+      controller.abort();
+    }
   }
 
   async #executeBatchTask(
@@ -790,6 +1233,8 @@ class PuppeteerRenderer implements Renderer {
         return this.imageResult({ ...task.options, signal, taskId });
       case 'pdf':
         return this.pdfResult({ ...task.options, signal, taskId });
+      case 'compare':
+        return this.compareResult({ ...task.options, signal, taskId });
       case 'evaluate':
         return this.evaluateResult({ ...task.options, signal, taskId });
     }

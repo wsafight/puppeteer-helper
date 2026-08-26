@@ -29,6 +29,10 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
+      - run: pnpm test:browser
+        env:
+          PPTR_AUTO_INSTALL: 'true'
+          PPTR_CACHE_DIR: ${{ runner.temp }}/pptr-helper-browser
       - uses: changesets/action@v1
         with:
           version: pnpm bump

@@ -1,24 +1,70 @@
 #!/usr/bin/env node
 
+import { createReadStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { once } from 'node:events';
+import { createInterface } from 'node:readline';
 
-import { createRenderer, installCompatibleChrome } from '../dist/index.js';
+import Ajv2020 from 'ajv/dist/2020.js';
+
+import {
+  CLI_REQUEST_SCHEMA,
+  createRenderer,
+  installCompatibleChrome,
+} from '../dist/index.js';
 
 const HELP = `pptr-helper JSON CLI
 
 Usage:
   pptr-helper --input request.json
   pptr-helper < request.json
+  pptr-helper --ndjson --input requests.ndjson
+  pptr-helper --ndjson < requests.ndjson
 
-Actions: image, pdf, extract, batch, install-browser
+Actions: image, pdf, extract, compare, batch, install-browser
+Commands: schema
 The command writes one JSON result to stdout and errors to stderr.
 `;
+
+const SCHEMA_COMMAND = Symbol('schema');
+const ajv = new Ajv2020({ allErrors: true, strict: false });
+const validateRequest = ajv.compile(CLI_REQUEST_SCHEMA);
+
+class CliValidationError extends Error {
+  constructor(issues) {
+    const first = issues[0];
+    const location = first?.instancePath || '/';
+    super(
+      `Invalid CLI request at ${location}: ${first?.message ?? 'unknown error'}`,
+    );
+    this.name = 'CliValidationError';
+    this.code = 'CLI_VALIDATION';
+    this.issues = issues;
+  }
+}
+
+const assertValidRequest = request => {
+  if (!validateRequest(request)) {
+    throw new CliValidationError(
+      (validateRequest.errors ?? []).map(error => ({
+        instancePath: error.instancePath || '/',
+        keyword: error.keyword,
+        message: error.message ?? 'is invalid',
+        params: error.params,
+        schemaPath: error.schemaPath,
+      })),
+    );
+  }
+};
 
 const parseArguments = async () => {
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) {
     process.stdout.write(HELP);
     return undefined;
+  }
+  if (args.includes('--schema') || args[0] === 'schema') {
+    return SCHEMA_COMMAND;
   }
 
   const inputIndex = args.indexOf('--input');
@@ -47,6 +93,9 @@ const serializeError = (error, depth = 0) => ({
   ...(error && typeof error === 'object' && 'code' in error
     ? { code: error.code }
     : {}),
+  ...(error && typeof error === 'object' && 'issues' in error
+    ? { issues: error.issues }
+    : {}),
   ...(depth < 3 && error instanceof Error && error.cause !== undefined
     ? { cause: serializeError(error.cause, depth + 1) }
     : {}),
@@ -57,17 +106,33 @@ const getOutputPath = task =>
 
 const serializeResult = (result, action, task) => {
   const outputPath = getOutputPath(task);
+  const artifacts = result.artifacts ? { artifacts: result.artifacts } : {};
   if (action === 'extract') {
-    return { data: result.data, metadata: result.metadata };
+    return { data: result.data, ...artifacts, metadata: result.metadata };
   }
   if (outputPath) {
-    return { outputPath, metadata: result.metadata };
+    return { outputPath, ...artifacts, metadata: result.metadata };
   }
   const base64 =
     typeof result.data === 'string'
       ? result.data
       : Buffer.from(result.data).toString('base64');
-  return { base64, metadata: result.metadata };
+  return { base64, ...artifacts, metadata: result.metadata };
+};
+
+const serializeComparison = (result, task) => {
+  const { actual, diff, ...comparison } = result.data;
+  return {
+    ...comparison,
+    ...(task.actualPath
+      ? { actualPath: task.actualPath }
+      : { actualBase64: Buffer.from(actual).toString('base64') }),
+    ...(task.diffPath
+      ? { diffPath: task.diffPath }
+      : { diffBase64: Buffer.from(diff).toString('base64') }),
+    ...(result.artifacts ? { artifacts: result.artifacts } : {}),
+    metadata: result.metadata,
+  };
 };
 
 const createExtractor = fields => {
@@ -125,7 +190,7 @@ const createExtractor = fields => {
 
 const toBatchTask = item => {
   const type = item.action === 'extract' ? 'evaluate' : item.action;
-  if (!['image', 'pdf', 'evaluate'].includes(type)) {
+  if (!['image', 'pdf', 'compare', 'evaluate'].includes(type)) {
     throw new Error(`Unsupported batch action: ${item.action}`);
   }
   return {
@@ -139,9 +204,7 @@ const toBatchTask = item => {
 };
 
 const executeRequest = async request => {
-  if (!request || typeof request !== 'object' || Array.isArray(request)) {
-    throw new Error('The CLI request must be a JSON object');
-  }
+  assertValidRequest(request);
   if (request.action === 'install-browser') {
     return installCompatibleChrome(request.browser);
   }
@@ -181,6 +244,12 @@ const executeRequest = async request => {
           request.task,
         );
         break;
+      case 'compare':
+        result = serializeComparison(
+          await renderer.compareResult(request.task),
+          request.task,
+        );
+        break;
       case 'batch': {
         if (!Array.isArray(request.tasks)) {
           throw new Error('batch requires a tasks array');
@@ -197,7 +266,10 @@ const executeRequest = async request => {
             id: item.id,
             index,
             status: item.status,
-            result: serializeResult(item.result, source.action, source.task),
+            result:
+              source.action === 'compare'
+                ? serializeComparison(item.result, source.task)
+                : serializeResult(item.result, source.action, source.task),
           };
         });
         break;
@@ -211,10 +283,60 @@ const executeRequest = async request => {
   }
 };
 
+const writeJsonLine = async value => {
+  if (!process.stdout.write(`${JSON.stringify(value)}\n`)) {
+    await once(process.stdout, 'drain');
+  }
+};
+
+const executeNdjson = async () => {
+  const args = process.argv.slice(2);
+  const inputIndex = args.indexOf('--input');
+  const inputPath = inputIndex >= 0 ? args[inputIndex + 1] : undefined;
+  if (inputIndex >= 0 && !inputPath) {
+    throw new Error('--input requires an NDJSON file path');
+  }
+
+  const input = inputPath ? createReadStream(inputPath, 'utf8') : process.stdin;
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  let failed = false;
+  let lineNumber = 0;
+
+  for await (const line of lines) {
+    lineNumber += 1;
+    if (!line.trim()) {
+      continue;
+    }
+    try {
+      const result = await executeRequest(JSON.parse(line));
+      await writeJsonLine({ line: lineNumber, result, status: 'fulfilled' });
+    } catch (error) {
+      failed = true;
+      await writeJsonLine({
+        error: serializeError(error),
+        line: lineNumber,
+        status: 'rejected',
+      });
+    }
+  }
+
+  if (failed) {
+    process.exitCode = 1;
+  }
+};
+
 try {
-  const request = await parseArguments();
-  if (request !== undefined) {
-    process.stdout.write(`${JSON.stringify(await executeRequest(request))}\n`);
+  if (process.argv.slice(2).includes('--ndjson')) {
+    await executeNdjson();
+  } else {
+    const request = await parseArguments();
+    if (request === SCHEMA_COMMAND) {
+      process.stdout.write(`${JSON.stringify(CLI_REQUEST_SCHEMA, null, 2)}\n`);
+    } else if (request !== undefined) {
+      process.stdout.write(
+        `${JSON.stringify(await executeRequest(request))}\n`,
+      );
+    }
   }
 } catch (error) {
   process.stderr.write(`${JSON.stringify({ error: serializeError(error) })}\n`);

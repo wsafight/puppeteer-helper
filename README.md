@@ -109,7 +109,7 @@ const links = await renderer.evaluate({
 
 ## 元素截图与结果元数据
 
-`imageResult()`、`pdfResult()` 和 `evaluateResult()` 在数据之外返回任务 ID、尝试次数、排队/渲染耗时、最终 URL、HTTP 状态、页面错误和网络统计。截图可以通过 `selector` 限定到单个元素。
+`imageResult()`、`pdfResult()`、`compareResult()` 和 `evaluateResult()` 在数据之外返回任务 ID、尝试次数、排队/渲染耗时、最终 URL、HTTP 状态、页面错误和网络统计。截图可以通过 `selector` 限定到单个元素。
 
 ```ts
 const result = await renderer.imageResult({
@@ -127,10 +127,31 @@ console.log(result.metadata);
 `RenderPageOptions` 支持以下常见场景：
 
 - `viewport`、`userAgent`、`headers` 和 `cookies`
+- `storageState` 恢复 cookie、localStorage 和 sessionStorage；`captureStorageState` 采集最终状态
+- `device` 使用 `desktop`、`mobile`、`tablet`、任意 Puppeteer `KnownDevices` 名称或自定义设备
 - URL 的 `navigation` 和 HTML 的 `content` 等待选项
 - `beforeNavigate`、`afterNavigate` 页面钩子
-- selector、network idle 和字体等待条件
+- selector、network idle、字体、延时、文本、函数以及递归 `all`/`any` 等待条件
 - Puppeteer 原生截图及 PDF 输出选项
+
+截图可使用 `open-graph`、`social-square`、`social-story` 预设，PDF 可使用 `invoice` 或 `report`。显式 viewport、UA 和输出选项会覆盖预设。移动页面应包含标准 `<meta name="viewport">` 才能按设备宽度布局。状态采集包含 BrowserContext cookie 和当前 origin 的 Web Storage。
+
+## 视觉比较与诊断产物
+
+`compare()` 渲染 PNG 并与文件路径或字节基线比较，返回像素差、差异比例、尺寸变化和通过状态。可以设置像素/比例阈值、忽略动态元素，并写出 actual 与 diff 图。
+
+```ts
+const comparison = await renderer.compare({
+  source: { url: 'https://example.com' },
+  baseline: 'baselines/home.png',
+  ignoreSelectors: ['[data-live-clock]'],
+  maxDiffRatio: 0.001,
+  actualPath: 'artifacts/home.png',
+  diffPath: 'artifacts/home.diff.png',
+});
+```
+
+任务级 `diagnostics` 可采集 console、失败请求、重定向，以及 HTML、MHTML 和轻量 HAR 产物；失败截图必须提供明确路径。诊断 HAR 面向快速排障，不包含响应体和完整网络时序。
 
 ## 并发、超时与取消
 
@@ -152,6 +173,32 @@ await task;
 
 `renderer.close()` 停止接收新任务并等待已经接收的任务完成。需要立即中止时使用 `renderer.close({ force: true })`。
 
+## 调度、缓存与浏览器池
+
+待执行任务按 `priority` 从高到低调度，同优先级保持 FIFO。`scheduler` 可限制单主机/单租户并发以及同一主机的启动间隔。任务通过 `tenantId` 参与租户限流，`tags` 会原样进入结果元数据。
+
+```ts
+const renderer = createRenderer({
+  scheduler: {
+    maxConcurrencyPerHost: 2,
+    minHostInterval: 100,
+    maxConcurrencyPerTenant: 4,
+    cacheMaxEntries: 200,
+  },
+});
+
+const result = await renderer.imageResult({
+  source: { url: 'https://example.com' },
+  priority: 10,
+  tenantId: 'customer-42',
+  resultCache: { key: 'home:desktop:v3', ttl: 60_000 },
+});
+```
+
+相同 `resultCache.key` 的并发任务会合并；`ttl: 0` 只做并发去重，不保留已完成结果。缓存键是显式契约，调用方必须将 URL、输出类型、viewport 和其他影响结果的输入编码进键中。
+
+需要跨浏览器隔离或更高吞吐时使用 `createRendererPool({ size, maxTasksPerBrowser, renderer })`。池会选择负载最低的 renderer，并可在完成指定任务数后回收空闲浏览器。
+
 ## 重试、批量与事件
 
 重试默认关闭，避免重复执行有副作用的页面操作。可以在 renderer 或单个任务上配置最大尝试次数、退避和错误判断；超时、取消、关闭、队列满和安全错误不会重试。
@@ -171,11 +218,26 @@ const results = await renderer.batch(tasks, {
 
 批量结果保持输入顺序，并分别标记 `fulfilled` 或 `rejected`，单个失败不会丢失其他结果。`renderer.stats` 还提供任务成功与失败计数。
 
+`createStructuredLoggerEventSink()`、`createRendererMetricsCollector()` 和 `createOpenTelemetryEventSink()` 可将生命周期事件接入结构化日志、Prometheus 和 OpenTelemetry。使用 `composeRendererEventSinks()` 可同时挂载多个接收器，单个接收器失败不会阻断其他接收器或渲染任务。
+
+```ts
+const metrics = createRendererMetricsCollector();
+const renderer = createRenderer({
+  onEvent: composeRendererEventSinks(
+    createStructuredLoggerEventSink(logger),
+    metrics.onEvent,
+    createOpenTelemetryEventSink(tracer),
+  ),
+});
+
+console.log(metrics.toPrometheus());
+```
+
 ## 网络控制与安全
 
 `network` 支持资源类型和 URL glob 阻断、离线模式、HTTP/代理认证以及自定义请求改写。代理服务器通过 renderer 或任务级 `contextOptions.proxyServer` 配置。
 
-面向不可信 URL 时，使用 `security.allowlist` 或 `blocklist` 限制 Chrome 可访问的地址，并设置每个任务的请求数和总响应字节预算。两种列表不能同时使用；私网默认禁止。
+面向不可信 URL 时，应显式传入 `security`，使用 `allowlist` 或 `blocklist` 限制 Chrome 可访问的地址，并设置每个任务的请求数和总响应字节预算。两种列表不能同时使用；启用 `security` 后私网默认禁止。未传入 `security` 时不会应用 URL 或私网访问策略。
 
 ```ts
 const renderer = createRenderer({
@@ -211,11 +273,14 @@ await renderer.image({
 
 ## JSON CLI 与 AI Skill
 
-npm 包提供 `pptr-helper` JSON CLI，支持 `image`、`pdf`、结构化 `extract`、`batch` 和 `install-browser`。输入可来自文件或 stdin，结果和结构化错误均为 JSON。
+npm 包提供 `pptr-helper` JSON CLI，支持 `image`、`pdf`、结构化 `extract`、PNG `compare`、`batch` 和 `install-browser`。每个请求会先按 JSON Schema 校验；`pptr-helper schema` 或 `--schema` 可输出 Schema。
 
 ```bash
 pnpm exec pptr-helper --input request.json
+pnpm exec pptr-helper --ndjson --input requests.ndjson
 ```
+
+`--ndjson` 逐行读取和输出，单行失败不会停止后续任务；任意一行失败时进程最终返回非零退出码。普通模式和 NDJSON 模式均支持 stdin。
 
 仓库和发布包同时包含 [`pptr-helper-render` skill](./skills/pptr-helper-render/SKILL.md)。支持 `SKILL.md` 的 AI agent 注册该目录后，可优先通过 CLI 完成确定性渲染；JSON schema 与高级 TypeScript API 分别位于 skill 的按需 reference 中。
 

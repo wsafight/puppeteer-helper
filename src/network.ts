@@ -39,13 +39,13 @@ export interface RendererSecurityOptions {
   allowlist?: string[];
   /** Chrome URLPattern entries blocked from loading. */
   blocklist?: string[];
-  /** Allow loopback, link-local, and private response addresses. @defaultValue false */
+  /** Allow loopback, link-local, and private response addresses after security is enabled. @defaultValue false */
   allowPrivateNetwork?: boolean;
   /** Allowed top-level navigation protocols. @defaultValue http:, https: */
   allowedProtocols?: string[];
   /** Maximum requests issued by one rendering attempt. */
   maxRequests?: number;
-  /** Maximum encoded response bytes transferred by one rendering attempt. */
+  /** Maximum transferred or decoded response bytes, whichever is greater, for one rendering attempt. */
   maxTotalResponseBytes?: number;
 }
 
@@ -330,27 +330,72 @@ export const setupPageNetwork = async (
   page.on('response', onResponse);
 
   let session: CDPSession | undefined;
+  let onDataReceived:
+    | ((event: {
+        requestId: string;
+        dataLength: number;
+        encodedDataLength: number;
+      }) => void)
+    | undefined;
   let onLoadingFinished:
-    ((event: { encodedDataLength: number }) => void) | undefined;
+    | ((event: { requestId: string; encodedDataLength: number }) => void)
+    | undefined;
+  let onLoadingFailed: ((event: { requestId: string }) => void) | undefined;
   if (security?.maxTotalResponseBytes) {
     stats.transferredBytes = 0;
     session = await page.createCDPSession();
     await session.send('Network.enable');
-    onLoadingFinished = event => {
+    const transferredByRequest = new Map<string, number>();
+    const budgetedByRequest = new Map<string, number>();
+    let budgetedBytes = 0;
+    const recordTransferredBytes = (bytes: number) => {
       stats.transferredBytes =
-        (stats.transferredBytes ?? 0) + Math.max(0, event.encodedDataLength);
+        (stats.transferredBytes ?? 0) + Math.max(0, bytes);
+    };
+    const enforceByteLimit = (bytes: number) => {
+      budgetedBytes += Math.max(0, bytes);
       if (
+        !failed &&
         security.maxTotalResponseBytes &&
-        stats.transferredBytes > security.maxTotalResponseBytes
+        budgetedBytes > security.maxTotalResponseBytes
       ) {
         fail(
           new RendererSecurityError(
             `Response byte limit exceeded: ${security.maxTotalResponseBytes}`,
           ),
         );
+        void session?.send('Page.stopLoading').catch(() => undefined);
       }
     };
+    onDataReceived = event => {
+      const encodedBytes = Math.max(0, event.encodedDataLength);
+      const budgetedChunk = Math.max(encodedBytes, event.dataLength);
+      transferredByRequest.set(
+        event.requestId,
+        (transferredByRequest.get(event.requestId) ?? 0) + encodedBytes,
+      );
+      budgetedByRequest.set(
+        event.requestId,
+        (budgetedByRequest.get(event.requestId) ?? 0) + budgetedChunk,
+      );
+      recordTransferredBytes(encodedBytes);
+      enforceByteLimit(budgetedChunk);
+    };
+    onLoadingFinished = event => {
+      const streamedBytes = transferredByRequest.get(event.requestId) ?? 0;
+      const budgetedRequestBytes = budgetedByRequest.get(event.requestId) ?? 0;
+      transferredByRequest.delete(event.requestId);
+      budgetedByRequest.delete(event.requestId);
+      recordTransferredBytes(event.encodedDataLength - streamedBytes);
+      enforceByteLimit(event.encodedDataLength - budgetedRequestBytes);
+    };
+    onLoadingFailed = event => {
+      transferredByRequest.delete(event.requestId);
+      budgetedByRequest.delete(event.requestId);
+    };
+    session.on('Network.dataReceived', onDataReceived);
     session.on('Network.loadingFinished', onLoadingFinished);
+    session.on('Network.loadingFailed', onLoadingFailed);
   }
 
   return {
@@ -359,8 +404,16 @@ export const setupPageNetwork = async (
     async dispose() {
       page.off('request', onRequest);
       page.off('response', onResponse);
-      if (session && onLoadingFinished) {
-        session.off('Network.loadingFinished', onLoadingFinished);
+      if (session) {
+        if (onDataReceived) {
+          session.off('Network.dataReceived', onDataReceived);
+        }
+        if (onLoadingFinished) {
+          session.off('Network.loadingFinished', onLoadingFinished);
+        }
+        if (onLoadingFailed) {
+          session.off('Network.loadingFailed', onLoadingFailed);
+        }
         await session.detach().catch(() => undefined);
       }
     },

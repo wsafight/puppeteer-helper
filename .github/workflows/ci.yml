@@ -87,5 +87,5 @@ jobs:
           cache: pnpm
           registry-url: https://registry.npmjs.org
       - run: pnpm install --frozen-lockfile
-      - run: node bin/pptr-helper.mjs --help
+      - run: pnpm test:cli
       - run: npm pack --dry-run

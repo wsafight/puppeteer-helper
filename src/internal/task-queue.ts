@@ -18,6 +18,8 @@ interface QueueEntry {
   reject: (reason: unknown) => void;
   signal?: AbortSignal;
   removeAbortListener?: () => void;
+  priority: number;
+  sequence: number;
 }
 
 export class TaskQueue {
@@ -27,6 +29,7 @@ export class TaskQueue {
   readonly #idleResolvers = new Set<() => void>();
   #active = 0;
   #accepting = true;
+  #sequence = 0;
 
   constructor({ maxConcurrency, maxQueueSize }: TaskQueueOptions) {
     this.#maxConcurrency = maxConcurrency;
@@ -42,7 +45,11 @@ export class TaskQueue {
     };
   }
 
-  enqueue<T>(run: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  enqueue<T>(
+    run: () => Promise<T>,
+    signal?: AbortSignal,
+    priority = 0,
+  ): Promise<T> {
     if (!this.#accepting) {
       return Promise.reject(new RendererClosedError());
     }
@@ -56,7 +63,10 @@ export class TaskQueue {
         resolve: value => resolve(value as T),
         reject,
         signal,
+        priority,
+        sequence: this.#sequence,
       };
+      this.#sequence += 1;
 
       if (this.#active < this.#maxConcurrency) {
         this.#start(entry);
@@ -81,7 +91,17 @@ export class TaskQueue {
           signal.removeEventListener('abort', onAbort);
       }
 
-      this.#pending.push(entry);
+      const insertAt = this.#pending.findIndex(
+        pending =>
+          entry.priority > pending.priority ||
+          (entry.priority === pending.priority &&
+            entry.sequence < pending.sequence),
+      );
+      if (insertAt < 0) {
+        this.#pending.push(entry);
+      } else {
+        this.#pending.splice(insertAt, 0, entry);
+      }
     });
   }
 

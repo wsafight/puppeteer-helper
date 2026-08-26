@@ -86,3 +86,18 @@ export const raceWithSignal = async <T>(
     removeAbortListener();
   }
 };
+
+export const raceWithSignalAndCleanup = async <T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+  cleanup: (value: T) => void | Promise<void>,
+): Promise<T> => {
+  try {
+    return await raceWithSignal(operation, signal);
+  } catch (error) {
+    if (signal.aborted) {
+      void operation.then(value => cleanup(value)).catch(() => undefined);
+    }
+    throw error;
+  }
+};

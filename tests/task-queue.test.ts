@@ -67,4 +67,30 @@ describe('TaskQueue', () => {
     await expect(pending).resolves.toBe('drained');
     await queue.onIdle();
   });
+
+  test('runs pending tasks by priority and preserves FIFO ties', async () => {
+    const queue = new TaskQueue({ maxConcurrency: 1, maxQueueSize: 4 });
+    const gate = deferred();
+    const order: string[] = [];
+    const active = queue.enqueue(async () => {
+      await gate.promise;
+      order.push('active');
+    });
+    const low = queue.enqueue(async () => order.push('low'), undefined, -1);
+    const highFirst = queue.enqueue(
+      async () => order.push('high-first'),
+      undefined,
+      10,
+    );
+    const highSecond = queue.enqueue(
+      async () => order.push('high-second'),
+      undefined,
+      10,
+    );
+
+    gate.resolve();
+    await Promise.all([active, low, highFirst, highSecond]);
+
+    expect(order).toEqual(['active', 'high-first', 'high-second', 'low']);
+  });
 });

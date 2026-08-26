@@ -66,5 +66,32 @@ describe('createRenderer', () => {
         executablePath: '/chrome',
       }),
     ).toThrow('connectOptions cannot be combined');
+    expect(() =>
+      createRenderer({ scheduler: { maxConcurrencyPerHost: -1 } }),
+    ).toThrow('scheduler.maxConcurrencyPerHost');
+  });
+
+  test('validates task scheduling options before launching Chrome', async () => {
+    const renderer = createRenderer();
+    const task = {
+      evaluate: async () => 'unused',
+      source: { html: '<main>unused</main>' } as const,
+    };
+
+    await expect(
+      renderer.evaluate({
+        ...task,
+        resultCache: { key: ' ' },
+      }),
+    ).rejects.toThrow('resultCache.key');
+    await expect(
+      renderer.evaluate({
+        ...task,
+        resultCache: { key: 'test', ttl: -1 },
+      }),
+    ).rejects.toThrow('resultCache.ttl');
+    await expect(renderer.evaluate({ ...task, priority: 1.5 })).rejects.toThrow(
+      'priority',
+    );
   });
 });
