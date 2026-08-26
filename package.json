@@ -1,6 +1,6 @@
 {
   "name": "pptr-helper",
-  "version": "0.0.4",
+  "version": "0.1.0",
   "type": "module",
   "description": "Deterministic webpage rendering for screenshots, PDFs, and extraction with Puppeteer.",
   "keywords": [
